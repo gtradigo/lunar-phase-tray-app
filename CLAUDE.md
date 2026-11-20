@@ -76,4 +76,4 @@ dependencies: everything comes from Ubuntu system packages. See README.md for us
 
 Ubuntu 22.04, GNOME on X11, with the Ubuntu AppIndicators extension. `AppIndicator3` is
 available; `AyatanaAppIndicator3` is not, and the code tries Ayatana first, then falls back.
-The project is not a git repo.
+Git remote: https://github.com/gtradigo/lunar-phase-tray-app (public), branch `main`.

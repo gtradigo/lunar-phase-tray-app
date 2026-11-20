@@ -322,14 +322,146 @@ def format_countdown(seconds: float) -> str:
     return f"{m}m"
 
 
-def format_local(t_unix: float, fmt: str = "%a %d %b %Y, %H:%M") -> str:
-    return datetime.fromtimestamp(t_unix).strftime(fmt)
+def format_local(t_unix: float, fmt: str = "%a %d %b %Y, %H:%M", tz=None) -> str:
+    """Format a Unix time in `tz` (a tzinfo), or the system local time if None."""
+    if tz is None:
+        return datetime.fromtimestamp(t_unix).strftime(fmt)
+    return datetime.fromtimestamp(t_unix, tz).strftime(fmt)
+
+
+# --------------------------------------------------------------------------
+# Location-dependent quantities: altitude/azimuth, rise, set, transit
+# --------------------------------------------------------------------------
+
+EARTH_RADIUS_KM = 6378.14
+
+
+def moon_equatorial(t_unix: float):
+    """Geocentric right ascension, declination (deg) and distance (km)."""
+    lon, lat, dist = moon_position(t_unix)
+    T = _centuries_tt(t_unix)
+    eps = _rad(23.439291 - 0.0130042 * T)
+    lam, bet = _rad(lon), _rad(lat)
+    ra = math.atan2(math.sin(lam) * math.cos(eps) - math.tan(bet) * math.sin(eps), math.cos(lam))
+    dec = math.asin(math.sin(bet) * math.cos(eps) + math.cos(bet) * math.sin(eps) * math.sin(lam))
+    return _norm360(math.degrees(ra)), math.degrees(dec), dist
+
+
+def gmst(t_unix: float) -> float:
+    """Greenwich mean sidereal time in degrees (Meeus 12.4)."""
+    jd = jd_from_unix(t_unix)
+    d = jd - 2451545.0
+    T = d / 36525.0
+    return _norm360(280.46061837 + 360.98564736629 * d + 0.000387933 * T**2 - T**3 / 38710000)
+
+
+def _hour_angle_geo_alt(t_unix: float, lat: float, lon: float):
+    """(hour angle deg in -180..180, geocentric altitude deg, distance km)."""
+    ra, dec, dist = moon_equatorial(t_unix)
+    H = _norm180(gmst(t_unix) + lon - ra)
+    phi, d, h = _rad(lat), _rad(dec), _rad(H)
+    alt = math.asin(math.sin(phi) * math.sin(d) + math.cos(phi) * math.cos(d) * math.cos(h))
+    return H, math.degrees(alt), dist
+
+
+def moon_altaz(t_unix: float, lat: float, lon: float):
+    """Topocentric altitude (deg, without refraction) and azimuth (deg from north, eastward)."""
+    ra, dec, dist = moon_equatorial(t_unix)
+    H = _rad(gmst(t_unix) + lon - ra)
+    phi, d = _rad(lat), _rad(dec)
+    alt = math.asin(math.sin(phi) * math.sin(d) + math.cos(phi) * math.cos(d) * math.cos(H))
+    az = math.atan2(math.sin(H), math.cos(H) * math.sin(phi) - math.tan(d) * math.cos(phi))
+    parallax = math.asin(EARTH_RADIUS_KM / dist)
+    alt_topo = alt - parallax * math.cos(alt)
+    return math.degrees(alt_topo), _norm360(math.degrees(az) + 180.0)
+
+
+def _rise_set_h0(dist_km: float) -> float:
+    """Geocentric altitude of the Moon's centre at apparent rise/set (Meeus ch. 15):
+    h0 = 0.7275·π − 34′ (parallax, refraction and semidiameter)."""
+    parallax = math.degrees(math.asin(EARTH_RADIUS_KM / dist_km))
+    return 0.7275 * parallax - 34.0 / 60.0
+
+
+def _bisect(f, a: float, b: float, fa: float, tol: float = 1.0) -> float:
+    while b - a > tol:
+        m = (a + b) / 2
+        fm = f(m)
+        if (fm > 0) == (fa > 0):
+            a, fa = m, fm
+        else:
+            b = m
+    return (a + b) / 2
+
+
+@dataclass
+class MoonSky:
+    altitude: float              # deg, topocentric, now
+    azimuth: float               # deg from north, now
+    above_horizon: bool
+    next_rise: float | None      # unix time, None if none in the search window
+    next_set: float | None
+    next_transit: float | None
+    transit_altitude: float | None
+    rises: list = None           # all (unix) rises / sets in the window
+    sets: list = None
+
+
+def moon_sky(t_unix: float, lat: float, lon: float, hours: float = 48.0) -> MoonSky:
+    """Rise / set / transit times for an observer (lat, lon in degrees, east +)."""
+    step = 600.0  # 10 min: the Moon can't rise and set within one step outside polar regions
+
+    def f_alt(t):
+        _, alt, dist = _hour_angle_geo_alt(t, lat, lon)
+        return alt - _rise_set_h0(dist)
+
+    def f_ha(t):
+        return _hour_angle_geo_alt(t, lat, lon)[0]
+
+    rises, sets, transits = [], [], []
+    t0 = t_unix
+    a_prev, h_prev = f_alt(t0), f_ha(t0)
+    end = t_unix + hours * 3600.0
+    t = t0
+    while t < end:
+        t2 = t + step
+        a2, h2 = f_alt(t2), f_ha(t2)
+        if (a_prev <= 0) != (a2 <= 0):
+            ev = _bisect(f_alt, t, t2, a_prev)
+            (rises if a_prev <= 0 else sets).append(ev)
+        # upper transit: hour angle goes from negative to positive (not the ±180 wrap)
+        if h_prev < 0 <= h2 and h2 - h_prev < 90:
+            transits.append(_bisect(f_ha, t, t2, h_prev))
+        t, a_prev, h_prev = t2, a2, h2
+
+    alt, az = moon_altaz(t_unix, lat, lon)
+    tr = transits[0] if transits else None
+    return MoonSky(
+        altitude=alt,
+        azimuth=az,
+        above_horizon=f_alt(t_unix) > 0,
+        next_rise=rises[0] if rises else None,
+        next_set=sets[0] if sets else None,
+        next_transit=tr,
+        transit_altitude=moon_altaz(tr, lat, lon)[0] if tr else None,
+        rises=rises,
+        sets=sets,
+    )
+
+
+COMPASS = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+           "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
+
+
+def compass(az: float) -> str:
+    return COMPASS[int((az % 360) / 22.5 + 0.5) % 16]
 
 
 if __name__ == "__main__":
     import sys
-    if len(sys.argv) > 1:
-        ts = datetime.fromisoformat(sys.argv[1]).replace(tzinfo=timezone.utc).timestamp()
+    args = sys.argv[1:]
+    if args and not args[0].lstrip("-").replace(".", "").isdigit():
+        ts = datetime.fromisoformat(args.pop(0)).replace(tzinfo=timezone.utc).timestamp()
     else:
         ts = time.time()
     mi = moon_info(ts)
@@ -341,3 +473,12 @@ if __name__ == "__main__":
     print(f"Moon in      : {mi.zodiac} (lon {mi.ecliptic_lon:.2f}, lat {mi.ecliptic_lat:.2f})")
     for name, t in mi.upcoming:
         print(f"{name:14s}: {datetime.fromtimestamp(t, timezone.utc):%Y-%m-%d %H:%M UTC}  (in {format_countdown(t - ts)})")
+    if len(args) >= 2:  # optional: <lat> <lon>
+        lat, lon = float(args[0]), float(args[1])
+        sky = moon_sky(ts, lat, lon)
+        utc = lambda t: f"{datetime.fromtimestamp(t, timezone.utc):%Y-%m-%d %H:%M:%S} UTC" if t else "—"  # noqa: E731
+        print(f"Observer     : lat {lat:+.4f}, lon {lon:+.4f}")
+        print(f"Alt / Az     : {sky.altitude:+.2f} deg / {sky.azimuth:.2f} deg ({compass(sky.azimuth)})")
+        print(f"Rises        : {', '.join(utc(t) for t in sky.rises) or '—'}")
+        print(f"Sets         : {', '.join(utc(t) for t in sky.sets) or '—'}")
+        print(f"Next transit : {utc(sky.next_transit)}  (alt {sky.transit_altitude or 0:.1f} deg)")

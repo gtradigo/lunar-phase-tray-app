@@ -44,7 +44,11 @@ DEFAULT_CONFIG = {
     "show_label": False,       # illumination % next to the icon
     "southern_hemisphere": False,
     "use_nasa_images": True,
+    # {"name": str, "lat": float, "lon": float (east +), "tz": IANA zone or ""}; None = unset
+    "location": None,
 }
+
+ZONE_TAB = "/usr/share/zoneinfo/zone1970.tab"
 
 
 def load_config() -> dict:
@@ -61,6 +65,158 @@ def save_config(cfg: dict) -> None:
     os.makedirs(CONFIG_DIR, exist_ok=True)
     with open(CONFIG_FILE, "w") as f:
         json.dump(cfg, f, indent=2)
+
+
+# --------------------------------------------------------------------------
+# Location helpers (fully offline: no geocoding service is contacted)
+# --------------------------------------------------------------------------
+
+def system_timezone() -> str:
+    """IANA name of the system timezone, e.g. 'Europe/Rome', or ''."""
+    try:
+        link = os.path.realpath("/etc/localtime")
+        if "/zoneinfo/" in link:
+            return link.split("/zoneinfo/", 1)[1]
+    except OSError:
+        pass
+    try:
+        with open("/etc/timezone") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def _dms(s: str, deg_digits: int) -> float:
+    """Parse the ±DDMM[SS] / ±DDDMM[SS] coordinates used in zone1970.tab."""
+    sign = -1 if s[0] == "-" else 1
+    s = s[1:]
+    d = int(s[:deg_digits])
+    m = int(s[deg_digits:deg_digits + 2])
+    sec = int(s[deg_digits + 2:] or 0)
+    return sign * (d + m / 60 + sec / 3600)
+
+
+def timezone_city(tz_name: str):
+    """(name, lat, lon) of the reference city of an IANA timezone, from the
+    system tz database, or None."""
+    try:
+        with open(ZONE_TAB) as f:
+            for line in f:
+                if line.startswith("#"):
+                    continue
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) >= 3 and parts[2] == tz_name:
+                    coord = parts[1]
+                    i = max(coord.rfind("+"), coord.rfind("-"))
+                    lat = _dms(coord[:i], 2)
+                    lon = _dms(coord[i:], 3)
+                    city = tz_name.rsplit("/", 1)[-1].replace("_", " ")
+                    return city, lat, lon
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def get_tzinfo(name: str):
+    if not name:
+        return None
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(name)
+    except Exception:
+        return None
+
+
+class LocationDialog(Gtk.Dialog):
+    """Enter observer coordinates and the timezone used to display times."""
+
+    def __init__(self, parent, loc: dict | None):
+        super().__init__(title="Set location", transient_for=parent, modal=True)
+        self.set_default_size(420, -1)
+        self.set_position(Gtk.WindowPosition.CENTER)
+        self.add_button("Clear location", Gtk.ResponseType.REJECT)
+        self.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        ok = self.add_button("Save", Gtk.ResponseType.OK)
+        ok.get_style_context().add_class("suggested-action")
+        self.set_default_response(Gtk.ResponseType.OK)
+
+        box = self.get_content_area()
+        box.set_border_width(16)
+        box.set_spacing(10)
+        intro = Gtk.Label(xalign=0, wrap=True, max_width_chars=50)
+        intro.set_markup(
+            "Your location is used for <b>moonrise, moonset and the Moon's position in "
+            "your sky</b>. It is stored only on this computer and never sent anywhere.\n"
+            "<small>Tip: in Google Maps, right-click a place to copy its coordinates.</small>")
+        box.pack_start(intro, False, False, 0)
+
+        grid = Gtk.Grid(column_spacing=10, row_spacing=8)
+        box.pack_start(grid, False, False, 0)
+        self.e_name = Gtk.Entry(placeholder_text="e.g. Home", activates_default=True)
+        self.e_lat = Gtk.Entry(placeholder_text="e.g. 41.9028  (north +, south −)", activates_default=True)
+        self.e_lon = Gtk.Entry(placeholder_text="e.g. 12.4964  (east +, west −)", activates_default=True)
+        self.e_tz = Gtk.Entry(placeholder_text="e.g. Europe/Rome (empty = system)", activates_default=True)
+        completion = Gtk.EntryCompletion()
+        store = Gtk.ListStore(str)
+        try:
+            from zoneinfo import available_timezones
+            for z in sorted(available_timezones()):
+                store.append([z])
+        except Exception:
+            pass
+        completion.set_model(store)
+        completion.set_text_column(0)
+        completion.set_match_func(lambda c, key, it: key.lower() in store[it][0].lower())
+        self.e_tz.set_completion(completion)
+        for i, (lbl, w) in enumerate([("Name", self.e_name), ("Latitude", self.e_lat),
+                                      ("Longitude", self.e_lon), ("Timezone", self.e_tz)]):
+            grid.attach(Gtk.Label(label=lbl, xalign=0), 0, i, 1, 1)
+            w.set_hexpand(True)
+            grid.attach(w, 1, i, 1, 1)
+
+        sys_tz = system_timezone()
+        city = timezone_city(sys_tz) if sys_tz else None
+        if city:
+            btn = Gtk.Button(label=f"Use {city[0]} ({sys_tz}) — from your system timezone")
+            btn.connect("clicked", lambda *_: self._fill(
+                {"name": city[0], "lat": city[1], "lon": city[2], "tz": sys_tz}))
+            box.pack_start(btn, False, False, 0)
+
+        self.err = Gtk.Label(xalign=0)
+        box.pack_start(self.err, False, False, 0)
+        if loc:
+            self._fill(loc)
+        elif sys_tz:
+            self.e_tz.set_text(sys_tz)
+        self.show_all()
+
+    def _fill(self, loc):
+        self.e_name.set_text(loc.get("name", ""))
+        self.e_lat.set_text(f"{loc['lat']:.4f}")
+        self.e_lon.set_text(f"{loc['lon']:.4f}")
+        self.e_tz.set_text(loc.get("tz", ""))
+
+    def get_location(self):
+        """Validated location dict, or raises ValueError with a message."""
+        def num(entry, lo, hi, what):
+            txt = entry.get_text().strip().replace(",", ".").rstrip("°")
+            try:
+                v = float(txt)
+            except ValueError:
+                raise ValueError(f"{what} must be a number") from None
+            if not lo <= v <= hi:
+                raise ValueError(f"{what} must be between {lo} and {hi}")
+            return v
+        lat = num(self.e_lat, -90, 90, "Latitude")
+        lon = num(self.e_lon, -180, 180, "Longitude")
+        tz = self.e_tz.get_text().strip()
+        if tz and get_tzinfo(tz) is None:
+            raise ValueError(f"Unknown timezone “{tz}”")
+        name = self.e_name.get_text().strip() or f"{lat:.2f}, {lon:.2f}"
+        return {"name": name, "lat": lat, "lon": lon, "tz": tz}
+
+    def show_error(self, msg):
+        self.err.set_markup(f"<span foreground='#c01c28'>{GLib.markup_escape_text(msg)}</span>")
 
 
 # --------------------------------------------------------------------------
@@ -177,6 +333,18 @@ class DetailsWindow(Gtk.Window):
         self.grid = Gtk.Grid(column_spacing=18, row_spacing=4)
         right.pack_start(self.grid, False, False, 6)
 
+        sky_hdr = Gtk.Box(spacing=8)
+        self.sky_title = Gtk.Label(label="Your sky", xalign=0)
+        self.sky_title.get_style_context().add_class("section")
+        loc_btn = Gtk.Button(label="Set location…")
+        loc_btn.set_relief(Gtk.ReliefStyle.NONE)
+        loc_btn.connect("clicked", lambda *_: self.app.edit_location(self))
+        sky_hdr.pack_start(self.sky_title, False, False, 0)
+        sky_hdr.pack_start(loc_btn, False, False, 0)
+        right.pack_start(sky_hdr, False, False, 0)
+        self.sky_grid = Gtk.Grid(column_spacing=18, row_spacing=4)
+        right.pack_start(self.sky_grid, False, False, 0)
+
         sec = Gtk.Label(label="Upcoming phases", xalign=0)
         sec.get_style_context().add_class("section")
         right.pack_start(sec, False, False, 0)
@@ -207,6 +375,8 @@ class DetailsWindow(Gtk.Window):
 
     def update_info(self, info: mp.MoonInfo):
         now = info.when
+        tz = self.app.tz
+        fl = lambda t, f="%a %d %b %Y, %H:%M": mp.format_local(t, f, tz)  # noqa: E731
         self.title_lbl.set_text(f"{info.emoji}  {info.phase_name}")
         self.pct_lbl.set_text(f"{info.illumination * 100:.1f}%")
         self.trend_lbl.set_markup(
@@ -216,9 +386,9 @@ class DetailsWindow(Gtk.Window):
         self.progress.set_text(f"Lunation {info.lunation_number}: {info.lunation_fraction * 100:.0f}% complete")
         self._fill_grid(self.grid, [
             ("Moon age", f"{info.age_days:.2f} days"),
-            ("Last new moon", f"{mp.format_local(info.prev_new)}"),
-            ("Next full moon", f"{mp.format_local(info.next_full)}  (in {mp.format_countdown(info.next_full - now)})"),
-            ("Next new moon", f"{mp.format_local(info.next_new)}  (in {mp.format_countdown(info.next_new - now)})"),
+            ("Last new moon", f"{fl(info.prev_new)}"),
+            ("Next full moon", f"{fl(info.next_full)}  (in {mp.format_countdown(info.next_full - now)})"),
+            ("Next new moon", f"{fl(info.next_new)}  (in {mp.format_countdown(info.next_new - now)})"),
             ("Distance", f"{info.distance_km:,.0f} km"),
             ("Apparent size", f"{info.angular_diameter_arcmin:.1f}′"),
             ("Phase angle", f"{info.phase_angle:.1f}°  (elongation {info.elongation:.1f}°)"),
@@ -227,11 +397,38 @@ class DetailsWindow(Gtk.Window):
         ])
         icons = {"New Moon": "🌑", "First Quarter": "🌓", "Full Moon": "🌕", "Last Quarter": "🌗"}
         self._fill_grid(self.phase_grid, [
-            (f"{icons[n]} {n}", f"{mp.format_local(t)}   in {mp.format_countdown(t - now)}")
+            (f"{icons[n]} {n}", f"{fl(t)}   in {mp.format_countdown(t - now)}")
             for n, t in info.upcoming
         ])
-        self.updated_lbl.set_text(f"Updated {datetime.fromtimestamp(now):%H:%M:%S}")
+        self._fill_sky(now, fl)
+        tz_note = f"  ·  times in {self.app.tz_label}" if tz else ""
+        self.updated_lbl.set_text(f"Updated {fl(now, '%H:%M:%S')}{tz_note}")
         self.set_icon_from_file(self.app.current_icon_path)
+
+    def _fill_sky(self, now, fl):
+        loc, sky = self.app.cfg.get("location"), self.app.sky
+        if not loc or not sky:
+            self.sky_title.set_text("Your sky")
+            self._fill_grid(self.sky_grid, [
+                ("📍", "Set your location to see moonrise, moonset\nand where the Moon is in your sky."),
+            ])
+            return
+        self.sky_title.set_text(f"Your sky — {loc['name']}")
+
+        def ev(t):
+            return f"{fl(t, '%a %d %b, %H:%M')}   in {mp.format_countdown(t - now)}" if t else "not within 48 h"
+        if sky.above_horizon:
+            pos = f"Above the horizon: {sky.altitude:.0f}° high, {mp.compass(sky.azimuth)} ({sky.azimuth:.0f}°)"
+        else:
+            pos = f"Below the horizon ({sky.altitude:.0f}°)"
+        rows = [("Now", pos)]
+        events = [("Moonrise", sky.next_rise), ("Moonset", sky.next_set)]
+        events.sort(key=lambda e: e[1] or float("inf"))
+        rows += [(n, ev(t)) for n, t in events]
+        if sky.next_transit:
+            rows.append(("Highest", f"{ev(sky.next_transit)}  ({sky.transit_altitude:.0f}° up)"))
+        rows.append(("Location", f"{loc['lat']:.4f}°, {loc['lon']:.4f}°"))
+        self._fill_grid(self.sky_grid, rows)
 
     def set_loading(self, loading: bool):
         if loading:
@@ -269,6 +466,7 @@ class LunarTray:
         os.makedirs(CACHE_DIR, exist_ok=True)
         self.cfg = load_config()
         self.info: mp.MoonInfo | None = None
+        self.sky: mp.MoonSky | None = None
         self.current_icon_path = ""
         self.window: DetailsWindow | None = None
         self._picture_key = None
@@ -304,12 +502,20 @@ class LunarTray:
         self.mi_dist = self._item(m)
         self.mi_sign = self._item(m)
         m.append(Gtk.SeparatorMenuItem())
+        self.mi_rise = self._item(m, cb=lambda *_: (
+            self.show_details() if self.cfg.get("location") else self.edit_location()))
+        self.mi_set = self._item(m)
+        m.append(Gtk.SeparatorMenuItem())
         self._item(m, "🔭  Show moon picture & details…")
         m.append(Gtk.SeparatorMenuItem())
 
         prefs = Gtk.MenuItem(label="Settings")
         sub = Gtk.Menu()
         prefs.set_submenu(sub)
+        self.mi_loc = Gtk.MenuItem(label="Set location…")
+        self.mi_loc.connect("activate", lambda *_: self.edit_location())
+        sub.append(self.mi_loc)
+        sub.append(Gtk.SeparatorMenuItem())
         self.ck_label = self._check(sub, "Show percentage in top bar", "show_label")
         self.ck_south = self._check(sub, "Southern hemisphere view", "southern_hemisphere")
         self.ck_nasa = self._check(sub, "Download NASA moon images", "use_nasa_images")
@@ -336,6 +542,38 @@ class LunarTray:
         menu.append(it)
         return it
 
+    # ---- location -------------------------------------------------------
+    @property
+    def tz(self):
+        loc = self.cfg.get("location")
+        return get_tzinfo(loc.get("tz", "")) if loc else None
+
+    @property
+    def tz_label(self) -> str:
+        loc = self.cfg.get("location")
+        return loc.get("tz", "") if loc else ""
+
+    def edit_location(self, parent=None):
+        dlg = LocationDialog(parent, self.cfg.get("location"))
+        while True:
+            resp = dlg.run()
+            if resp == Gtk.ResponseType.OK:
+                try:
+                    loc = dlg.get_location()
+                except ValueError as e:
+                    dlg.show_error(str(e))
+                    continue
+                self.cfg["location"] = loc
+                # Sensible default: show the Moon as seen from the user's hemisphere
+                self.cfg["southern_hemisphere"] = loc["lat"] < 0
+                self.ck_south.set_active(self.cfg["southern_hemisphere"])
+            elif resp == Gtk.ResponseType.REJECT:
+                self.cfg["location"] = None
+            break
+        dlg.destroy()
+        save_config(self.cfg)
+        self.refresh(force_picture=True)
+
     def _toggle_autostart(self, w):
         if w.get_active():
             os.makedirs(os.path.dirname(AUTOSTART_FILE), exist_ok=True)
@@ -352,6 +590,9 @@ class LunarTray:
     def refresh(self, force_picture: bool = False):
         info = mp.moon_info()
         self.info = info
+        loc = self.cfg.get("location")
+        self.sky = mp.moon_sky(info.when, loc["lat"], loc["lon"]) if loc else None
+        tz = self.tz
         south = self.cfg["southern_hemisphere"]
         now = info.when
 
@@ -375,16 +616,33 @@ class LunarTray:
         self.mi_trend.set_label("▲ Waxing (growing)" if info.waxing else "▼ Waning (shrinking)")
         self.mi_age.set_label(f"Age: {info.age_days:.1f} days  ·  {info.lunation_fraction * 100:.0f}% of cycle")
         self.mi_full.set_label(f"🌕 Full moon in {mp.format_countdown(info.next_full - now)}  —  "
-                               f"{mp.format_local(info.next_full, '%a %d %b, %H:%M')}")
+                               f"{mp.format_local(info.next_full, '%a %d %b, %H:%M', tz)}")
         self.mi_new.set_label(f"🌑 New moon in {mp.format_countdown(info.next_new - now)}  —  "
-                              f"{mp.format_local(info.next_new, '%a %d %b, %H:%M')}")
+                              f"{mp.format_local(info.next_new, '%a %d %b, %H:%M', tz)}")
         qn, qt = ("First quarter", info.next_first_quarter) \
             if info.next_first_quarter < info.next_last_quarter else ("Last quarter", info.next_last_quarter)
         qe = "🌓" if qn == "First quarter" else "🌗"
         self.mi_quarter.set_label(f"{qe} {qn} in {mp.format_countdown(qt - now)}  —  "
-                                  f"{mp.format_local(qt, '%a %d %b, %H:%M')}")
+                                  f"{mp.format_local(qt, '%a %d %b, %H:%M', tz)}")
         self.mi_dist.set_label(f"Distance: {info.distance_km:,.0f} km  ·  {info.angular_diameter_arcmin:.1f}′")
         self.mi_sign.set_label(f"Moon in {mp.ZODIAC_SYMBOLS[mp.ZODIAC.index(info.zodiac)]} {info.zodiac}")
+        sky = self.sky
+        if sky:
+            def ev(t):
+                return mp.format_local(t, "%a %H:%M", tz) if t else "—"
+            events = sorted([("🌙↑ Moonrise", sky.next_rise), ("🌙↓ Moonset", sky.next_set)],
+                            key=lambda e: e[1] or float("inf"))
+            self.mi_rise.set_label(f"{events[0][0]} {ev(events[0][1])}  ·  {events[1][0]} {ev(events[1][1])}")
+            if sky.above_horizon:
+                self.mi_set.set_label(f"Up now: {sky.altitude:.0f}° high, {mp.compass(sky.azimuth)}  —  {loc['name']}")
+            else:
+                self.mi_set.set_label(f"Below the horizon now  —  {loc['name']}")
+            self.mi_set.show()
+            self.mi_loc.set_label(f"Location: {loc['name']}…")
+        else:
+            self.mi_rise.set_label("📍 Set your location for moonrise & moonset…")
+            self.mi_set.hide()
+            self.mi_loc.set_label("Set location…")
 
         if self.window:
             self.window.update_info(info)

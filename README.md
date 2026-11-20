@@ -1,4 +1,8 @@
-# Lunar Phase tray app
+<p align="center">
+  <img src="assets/logo.png" alt="Lunar Phase logo: a waxing gibbous Moon on a starry night-sky badge" width="160">
+</p>
+
+<h1 align="center">Lunar Phase tray app</h1>
 
 A top-bar (AppIndicator) app for Linux that shows the current Moon phase as its icon.
 
@@ -49,3 +53,9 @@ AppIndicator extension, which Ubuntu ships by default.
 - `moonrender.py` draws the tray icons with cairo, plus the offline fallback picture.
 - Icons, downloaded images and the lock file go in `~/.cache/lunar-phase-tray/`. Settings
   are saved in `~/.config/lunar-phase-tray/config.json`.
+
+## Credits
+
+Moon imagery, including the photo in the logo, is from the
+[NASA Scientific Visualization Studio](https://svs.gsfc.nasa.gov/) *Dial-A-Moon* (public domain).
+`tools/make_logo.py` builds `assets/logo.png` from one of those images.

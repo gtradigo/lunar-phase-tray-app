@@ -27,6 +27,8 @@ dependencies: everything comes from Ubuntu system packages. See README.md for us
   - `LocationDialog` edits the location. `edit_location()` saves it and sets
     `southern_hemisphere` from the latitude, which the user can still toggle afterwards.
   - It also holds the NASA download, config, the autostart entry and the single-instance lock.
+- `assets/logo.png`: README logo (512 px), built by `tools/make_logo.py` from a cached NASA
+  image. It is not the app's `icon.png`, which is a cairo-drawn phase icon.
 - `install.sh`: checks the apt dependencies, then writes `~/.local/share/applications` and
   `~/.config/autostart` entries and starts the app.
 
